@@ -1,0 +1,599 @@
+CREATE OR REPLACE PACKAGE sec_pkg IS
+    g_pepper CONSTANT VARCHAR2(64) := 'REPLACE_WITH_SECURE_PEPPER_32_BYTES';
+    FUNCTION hash_with_salt(p_password IN VARCHAR2, p_salt IN RAW) RETURN RAW;
+    FUNCTION gen_salt RETURN RAW;
+    FUNCTION validate_password_policy(p_password IN VARCHAR2) RETURN BOOLEAN;
+    FUNCTION get_current_user_id RETURN VARCHAR2;
+END sec_pkg;
+/
+CREATE OR REPLACE PACKAGE BODY sec_pkg IS
+    FUNCTION gen_salt RETURN RAW IS BEGIN RETURN DBMS_CRYPTO.RANDOMBYTES(16); END;
+    FUNCTION hash_with_salt(p_password IN VARCHAR2, p_salt IN RAW) RETURN RAW IS
+        v_raw RAW(32767);
+        v_hashed RAW(32);
+    BEGIN
+        v_raw := p_salt || UTL_I18N.STRING_TO_RAW(p_password, 'AL32UTF8') || UTL_I18N.STRING_TO_RAW(g_pepper, 'AL32UTF8');
+        v_hashed := DBMS_CRYPTO.HASH(v_raw, DBMS_CRYPTO.HASH_SH256);
+        RETURN v_hashed;
+    END;
+    FUNCTION validate_password_policy(p_password IN VARCHAR2) RETURN BOOLEAN IS
+    BEGIN
+        IF LENGTH(p_password) < 8 THEN RETURN FALSE; END IF;
+        IF NOT REGEXP_LIKE(p_password, '[A-Za-z]') THEN RETURN FALSE; END IF;
+        IF NOT REGEXP_LIKE(p_password, '[0-9]') THEN RETURN FALSE; END IF;
+        RETURN TRUE;
+    END;
+    FUNCTION get_current_user_id RETURN VARCHAR2 IS
+        v_user_name VARCHAR2(128);
+        v_user_id VARCHAR2(36);
+    BEGIN
+        v_user_name := SYS_CONTEXT('USERENV','SESSION_USER');
+        BEGIN
+            SELECT USER_ID INTO v_user_id FROM System_Users WHERE USERNAME = v_user_name AND ROWNUM = 1;
+            RETURN v_user_id;
+        EXCEPTION WHEN NO_DATA_FOUND THEN RETURN NULL;
+        END;
+    END;
+END sec_pkg;
+/
+CREATE TABLE System_Users (
+    USER_ID VARCHAR2(36) PRIMARY KEY,
+    USERNAME VARCHAR2(50) UNIQUE NOT NULL,
+    PASSWORD_HASH RAW(32) NOT NULL,
+    SALT RAW(16) NOT NULL,
+    USER_ROLE VARCHAR2(20) CHECK (USER_ROLE IN ('ADMIN','PHARMACIST','DOCTOR','PATIENT','AUDITOR')),
+    IS_ACTIVE NUMBER(1) DEFAULT 1,
+    LAST_LOGIN DATE,
+    CREATED_DATE DATE DEFAULT SYSDATE,
+    CREATED_BY VARCHAR2(36)
+);
+CREATE TABLE Audit_Log (
+    AUDIT_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    TABLE_NAME VARCHAR2(50) NOT NULL,
+    OPERATION_TYPE VARCHAR2(10) CHECK (OPERATION_TYPE IN ('INSERT','UPDATE','DELETE','ERROR')),
+    RECORD_ID VARCHAR2(200),
+    OLD_VALUES_SUMMARY VARCHAR2(4000),
+    NEW_VALUES_SUMMARY VARCHAR2(4000),
+    CHANGED_BY VARCHAR2(36),
+    IP_ADDRESS VARCHAR2(45),
+    CHANGE_TIMESTAMP TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+CREATE TABLE Patient (
+    P_AADHAR_ID VARCHAR2(12) PRIMARY KEY,
+    NAME VARCHAR2(100) NOT NULL,
+    PATIENT_ADDRESS VARCHAR2(200) DEFAULT NULL,
+    AGE NUMBER CHECK (AGE > 0),
+    PRIMARY_PHY_ID VARCHAR2(12),
+    EMAIL VARCHAR2(100) DEFAULT NULL,
+    PHONE VARCHAR2(15) DEFAULT NULL,
+    BLOOD_GROUP VARCHAR2(5),
+    ALLERGIES VARCHAR2(500),
+    INSURANCE_ID VARCHAR2(50),
+    CREATED_DATE DATE DEFAULT SYSDATE,
+    MODIFIED_DATE DATE,
+    IS_ACTIVE NUMBER(1) DEFAULT 1
+);
+CREATE TABLE Doctor (
+    D_AADHAR_ID VARCHAR2(12) PRIMARY KEY,
+    NAME VARCHAR2(100) NOT NULL,
+    SPECIALITY VARCHAR2(100),
+    YRS_OF_EXP NUMBER CHECK (YRS_OF_EXP >= 0),
+    LICENSE_NUMBER VARCHAR2(50) UNIQUE,
+    EMAIL VARCHAR2(100) DEFAULT NULL,
+    PHONE VARCHAR2(15) DEFAULT NULL,
+    CONSULTATION_FEE NUMBER,
+    DOCTOR_ADDRESS VARCHAR2(200) DEFAULT NULL,
+    CREATED_DATE DATE DEFAULT SYSDATE,
+    IS_ACTIVE NUMBER(1) DEFAULT 1
+);
+CREATE TABLE PharmaceuticalCompany (
+    PNAME VARCHAR2(100) PRIMARY KEY,
+    PHONE_NUMBER VARCHAR2(15) DEFAULT NULL,
+    COMPANY_ADDRESS VARCHAR2(200) DEFAULT NULL,
+    EMAIL VARCHAR2(100) DEFAULT NULL,
+    LICENSE_NUMBER VARCHAR2(50),
+    ESTABLISHED_YEAR NUMBER,
+    CREATED_DATE DATE DEFAULT SYSDATE
+);
+CREATE TABLE Drug (
+    TRADE_NAME VARCHAR2(100),
+    DNO NUMBER,
+    FORMULA VARCHAR2(100),
+    PNAME VARCHAR2(100),
+    DRUG_PRICE NUMBER,
+    PRICE NUMBER,
+    CATEGORY VARCHAR2(50),
+    REQUIRES_PRESCRIPTION NUMBER(1) DEFAULT 1,
+    SIDE_EFFECTS VARCHAR2(500),
+    DOSAGE_FORM VARCHAR2(50),
+    STRENGTH VARCHAR2(50),
+    REORDER_LEVEL NUMBER DEFAULT 50,
+    IS_ACTIVE NUMBER(1) DEFAULT 1,
+    PRIMARY KEY (TRADE_NAME, DNO),
+    FOREIGN KEY (PNAME) REFERENCES PharmaceuticalCompany(PNAME) ON DELETE SET NULL
+);
+CREATE TABLE Drug_Interactions (
+    INTERACTION_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    DRUG1_NAME VARCHAR2(100) NOT NULL,
+    DRUG1_DNO NUMBER NOT NULL,
+    DRUG2_NAME VARCHAR2(100) NOT NULL,
+    DRUG2_DNO NUMBER NOT NULL,
+    SEVERITY VARCHAR2(20) CHECK (SEVERITY IN ('MILD','MODERATE','SEVERE','CRITICAL')),
+    DESCRIPTION VARCHAR2(1000),
+    CONSTRAINT ui_drug_interactions_unique UNIQUE (DRUG1_NAME, DRUG1_DNO, DRUG2_NAME, DRUG2_DNO),
+    FOREIGN KEY (DRUG1_NAME, DRUG1_DNO) REFERENCES Drug(TRADE_NAME, DNO),
+    FOREIGN KEY (DRUG2_NAME, DRUG2_DNO) REFERENCES Drug(TRADE_NAME, DNO)
+);
+CREATE TABLE Pharmacy (
+    PHARMACY_ADDRESS VARCHAR2(200),
+    PHARMACY_NAME VARCHAR2(100),
+    PNAME VARCHAR2(100),
+    PHONE_NO VARCHAR2(15) DEFAULT NULL,
+    EMAIL VARCHAR2(100) DEFAULT NULL,
+    LICENSE_NUMBER VARCHAR2(50) UNIQUE,
+    OPERATING_HOURS VARCHAR2(100),
+    IS_ACTIVE NUMBER(1) DEFAULT 1,
+    PRIMARY KEY (PHARMACY_ADDRESS, PHARMACY_NAME),
+    FOREIGN KEY (PNAME) REFERENCES PharmaceuticalCompany(PNAME) ON DELETE SET NULL
+);
+CREATE TABLE Pharmacy_Stock (
+    STOCK_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    PHARMACY_ADDRESS VARCHAR2(200),
+    PHARMACY_NAME VARCHAR2(100),
+    TRADE_NAME VARCHAR2(100),
+    DNO NUMBER,
+    QUANTITY NUMBER DEFAULT 0,
+    BATCH_NUMBER VARCHAR2(50),
+    EXPIRY_DATE DATE,
+    LAST_RESTOCKED DATE DEFAULT SYSDATE,
+    MIN_STOCK_LEVEL NUMBER DEFAULT 20,
+    REORDER_QUANTITY NUMBER DEFAULT NULL,
+    CONSTRAINT uq_pharmstock_unique UNIQUE (PHARMACY_ADDRESS, PHARMACY_NAME, TRADE_NAME, DNO),
+    FOREIGN KEY (PHARMACY_ADDRESS, PHARMACY_NAME) REFERENCES Pharmacy(PHARMACY_ADDRESS, PHARMACY_NAME) ON DELETE CASCADE,
+    FOREIGN KEY (TRADE_NAME, DNO) REFERENCES Drug(TRADE_NAME, DNO) ON DELETE SET NULL
+);
+CREATE TABLE Prescription (
+    PNO NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    P_DATE DATE,
+    QUANTITY NUMBER,
+    D_AADHAR_ID VARCHAR2(12),
+    P_AADHAR_ID VARCHAR2(12),
+    TRADE_NAME VARCHAR2(100),
+    DNO NUMBER,
+    DOSAGE_INSTRUCTIONS VARCHAR2(500),
+    DURATION_DAYS NUMBER,
+    REFILLS_ALLOWED NUMBER DEFAULT 0,
+    REFILLS_REMAINING NUMBER DEFAULT 0,
+    STATUS VARCHAR2(20) DEFAULT 'ACTIVE' CHECK (STATUS IN ('ACTIVE','COMPLETED','CANCELLED','EXPIRED')),
+    NOTES VARCHAR2(500),
+    CREATED_DATE DATE DEFAULT SYSDATE,
+    FOREIGN KEY (P_AADHAR_ID) REFERENCES Patient(P_AADHAR_ID) ON DELETE SET NULL,
+    FOREIGN KEY (D_AADHAR_ID) REFERENCES Doctor(D_AADHAR_ID) ON DELETE SET NULL,
+    FOREIGN KEY (TRADE_NAME, DNO) REFERENCES Drug(TRADE_NAME, DNO) ON DELETE SET NULL
+);
+CREATE TABLE Prescription_Refills (
+    REFILL_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    PNO NUMBER,
+    TRADE_NAME VARCHAR2(100),
+    DNO NUMBER,
+    REFILL_DATE DATE DEFAULT SYSDATE,
+    PHARMACY_ADDRESS VARCHAR2(200),
+    PHARMACY_NAME VARCHAR2(100),
+    QUANTITY_DISPENSED NUMBER,
+    DISPENSED_BY VARCHAR2(36),
+    FOREIGN KEY (PNO) REFERENCES Prescription(PNO) ON DELETE CASCADE,
+    FOREIGN KEY (PHARMACY_ADDRESS, PHARMACY_NAME) REFERENCES Pharmacy(PHARMACY_ADDRESS, PHARMACY_NAME),
+    FOREIGN KEY (DISPENSED_BY) REFERENCES System_Users(USER_ID)
+);
+CREATE TABLE Contract (
+    CONTRACT_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    PNAME VARCHAR2(100),
+    PHARMACY_ADDRESS VARCHAR2(200),
+    PHARMACY_NAME VARCHAR2(100),
+    START_DATE DATE,
+    END_DATE DATE,
+    SUPERVISOR VARCHAR2(12),
+    CONTRACT_CONTENT VARCHAR2(500),
+    CONTRACT_VALUE NUMBER,
+    STATUS VARCHAR2(20) DEFAULT 'ACTIVE' CHECK (STATUS IN ('ACTIVE','EXPIRED','TERMINATED')),
+    CREATED_DATE DATE DEFAULT SYSDATE,
+    FOREIGN KEY (PHARMACY_ADDRESS, PHARMACY_NAME) REFERENCES Pharmacy(PHARMACY_ADDRESS, PHARMACY_NAME) ON DELETE SET NULL,
+    FOREIGN KEY (PNAME) REFERENCES PharmaceuticalCompany(PNAME) ON DELETE SET NULL,
+    FOREIGN KEY (SUPERVISOR) REFERENCES Doctor(D_AADHAR_ID)
+);
+CREATE TABLE Insurance_Claims (
+    CLAIM_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    P_AADHAR_ID VARCHAR2(12),
+    PNO NUMBER,
+    INSURANCE_ID VARCHAR2(50),
+    CLAIM_AMOUNT NUMBER,
+    CLAIM_DATE DATE DEFAULT SYSDATE,
+    APPROVAL_STATUS VARCHAR2(20) DEFAULT 'PENDING' CHECK (APPROVAL_STATUS IN ('PENDING','APPROVED','REJECTED','PROCESSED')),
+    APPROVED_AMOUNT NUMBER,
+    PROCESSED_DATE DATE,
+    REJECTION_REASON VARCHAR2(500),
+    FOREIGN KEY (P_AADHAR_ID) REFERENCES Patient(P_AADHAR_ID) ON DELETE CASCADE,
+    FOREIGN KEY (PNO) REFERENCES Prescription(PNO) ON DELETE CASCADE
+);
+CREATE TABLE Reorder_Requests (
+    REQUEST_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    PHARMACY_ADDRESS VARCHAR2(200),
+    PHARMACY_NAME VARCHAR2(100),
+    TRADE_NAME VARCHAR2(100),
+    DNO NUMBER,
+    REQUESTED_QUANTITY NUMBER,
+    REQUEST_DATE DATE DEFAULT SYSDATE,
+    STATUS VARCHAR2(20) DEFAULT 'PENDING' CHECK (STATUS IN ('PENDING','APPROVED','ORDERED','RECEIVED','CANCELLED')),
+    APPROVED_BY VARCHAR2(36),
+    APPROVAL_DATE DATE,
+    FOREIGN KEY (PHARMACY_ADDRESS, PHARMACY_NAME) REFERENCES Pharmacy(PHARMACY_ADDRESS, PHARMACY_NAME),
+    FOREIGN KEY (TRADE_NAME, DNO) REFERENCES Drug(TRADE_NAME, DNO),
+    FOREIGN KEY (APPROVED_BY) REFERENCES System_Users(USER_ID)
+);
+ALTER TABLE Patient ADD CONSTRAINT fk_patient_doctor FOREIGN KEY (PRIMARY_PHY_ID) REFERENCES Doctor(D_AADHAR_ID) ON DELETE SET NULL;
+CREATE INDEX idx_patient_name ON Patient(NAME);
+CREATE INDEX idx_doctor_speciality ON Doctor(SPECIALITY);
+CREATE INDEX idx_prescription_date ON Prescription(P_DATE);
+CREATE INDEX idx_audit_timestamp ON Audit_Log(CHANGE_TIMESTAMP);
+CREATE INDEX idx_drug_category ON Drug(CATEGORY);
+CREATE INDEX idx_low_stock ON Pharmacy_Stock(QUANTITY, MIN_STOCK_LEVEL);
+CREATE OR REPLACE TRIGGER trg_audit_patient
+AFTER INSERT OR UPDATE OR DELETE ON Patient
+FOR EACH ROW
+DECLARE
+    v_user_id VARCHAR2(36) := sec_pkg.get_current_user_id();
+    v_ip VARCHAR2(45) := SYS_CONTEXT('USERENV','IP_ADDRESS');
+    v_old_summary VARCHAR2(4000);
+    v_new_summary VARCHAR2(4000);
+BEGIN
+    IF INSERTING THEN
+        v_new_summary := SUBSTR('Name:' || NVL(:NEW.NAME,'') || '; Addr:' || NVL(:NEW.PATIENT_ADDRESS,''),1,4000);
+        INSERT INTO Audit_Log (TABLE_NAME, OPERATION_TYPE, RECORD_ID, NEW_VALUES_SUMMARY, CHANGED_BY, IP_ADDRESS)
+        VALUES ('PATIENT','INSERT', :NEW.P_AADHAR_ID, v_new_summary, v_user_id, v_ip);
+    ELSIF UPDATING THEN
+        v_old_summary := SUBSTR('Name:' || NVL(:OLD.NAME,'') || '; Addr:' || NVL(:OLD.PATIENT_ADDRESS,''),1,4000);
+        v_new_summary := SUBSTR('Name:' || NVL(:NEW.NAME,'') || '; Addr:' || NVL(:NEW.PATIENT_ADDRESS,''),1,4000);
+        INSERT INTO Audit_Log (TABLE_NAME, OPERATION_TYPE, RECORD_ID, OLD_VALUES_SUMMARY, NEW_VALUES_SUMMARY, CHANGED_BY, IP_ADDRESS)
+        VALUES ('PATIENT','UPDATE', :NEW.P_AADHAR_ID, v_old_summary, v_new_summary, v_user_id, v_ip);
+    ELSIF DELETING THEN
+        v_old_summary := SUBSTR('Name:' || NVL(:OLD.NAME,'') || '; Addr:' || NVL(:OLD.PATIENT_ADDRESS,''),1,4000);
+        INSERT INTO Audit_Log (TABLE_NAME, OPERATION_TYPE, RECORD_ID, OLD_VALUES_SUMMARY, CHANGED_BY, IP_ADDRESS)
+        VALUES ('PATIENT','DELETE', :OLD.P_AADHAR_ID, v_old_summary, v_user_id, v_ip);
+    END IF;
+END;
+/
+CREATE OR REPLACE TRIGGER trg_audit_prescription
+AFTER INSERT OR UPDATE OR DELETE ON Prescription
+FOR EACH ROW
+DECLARE
+    v_user_id VARCHAR2(36) := sec_pkg.get_current_user_id();
+    v_ip VARCHAR2(45) := SYS_CONTEXT('USERENV','IP_ADDRESS');
+    v_old_summary VARCHAR2(4000);
+    v_new_summary VARCHAR2(4000);
+BEGIN
+    IF INSERTING THEN
+        v_new_summary := SUBSTR('Patient:'||NVL(:NEW.P_AADHAR_ID,'')||';Drug:'||NVL(:NEW.TRADE_NAME,''),1,4000);
+        INSERT INTO Audit_Log (TABLE_NAME, OPERATION_TYPE, RECORD_ID, NEW_VALUES_SUMMARY, CHANGED_BY, IP_ADDRESS)
+        VALUES ('PRESCRIPTION','INSERT', TO_CHAR(:NEW.PNO), v_new_summary, v_user_id, v_ip);
+    ELSIF UPDATING THEN
+        v_old_summary := SUBSTR('PNO:'||TO_CHAR(:OLD.PNO)||';Status:'||NVL(:OLD.STATUS,''),1,4000);
+        v_new_summary := SUBSTR('PNO:'||TO_CHAR(:NEW.PNO)||';Status:'||NVL(:NEW.STATUS,''),1,4000);
+        INSERT INTO Audit_Log (TABLE_NAME, OPERATION_TYPE, RECORD_ID, OLD_VALUES_SUMMARY, NEW_VALUES_SUMMARY, CHANGED_BY, IP_ADDRESS)
+        VALUES ('PRESCRIPTION','UPDATE', TO_CHAR(:NEW.PNO), v_old_summary, v_new_summary, v_user_id, v_ip);
+    ELSIF DELETING THEN
+        v_old_summary := SUBSTR('Patient:'||NVL(:OLD.P_AADHAR_ID,'')||';Drug:'||NVL(:OLD.TRADE_NAME,''),1,4000);
+        INSERT INTO Audit_Log (TABLE_NAME, OPERATION_TYPE, RECORD_ID, OLD_VALUES_SUMMARY, CHANGED_BY, IP_ADDRESS)
+        VALUES ('PRESCRIPTION','DELETE', TO_CHAR(:OLD.PNO), v_old_summary, v_user_id, v_ip);
+    END IF;
+END;
+/
+CREATE OR REPLACE TRIGGER trg_auto_reorder
+AFTER INSERT OR UPDATE ON Pharmacy_Stock
+FOR EACH ROW
+DECLARE
+    v_count NUMBER;
+    v_req_qty NUMBER;
+    v_min_default CONSTANT NUMBER := 50;
+    v_user_id VARCHAR2(36) := sec_pkg.get_current_user_id();
+    v_ip VARCHAR2(45) := SYS_CONTEXT('USERENV','IP_ADDRESS');
+BEGIN
+    IF :NEW.QUANTITY IS NOT NULL AND :NEW.MIN_STOCK_LEVEL IS NOT NULL AND :NEW.QUANTITY < :NEW.MIN_STOCK_LEVEL THEN
+        v_req_qty := NVL(:NEW.REORDER_QUANTITY, NVL(:NEW.MIN_STOCK_LEVEL, v_min_default) * 2);
+        IF v_req_qty <= 0 THEN v_req_qty := v_min_default * 2; END IF;
+        SELECT COUNT(*) INTO v_count FROM Reorder_Requests WHERE PHARMACY_ADDRESS = :NEW.PHARMACY_ADDRESS AND PHARMACY_NAME = :NEW.PHARMACY_NAME AND TRADE_NAME = :NEW.TRADE_NAME AND DNO = :NEW.DNO AND STATUS = 'PENDING';
+        IF v_count = 0 THEN
+            INSERT INTO Reorder_Requests (PHARMACY_ADDRESS, PHARMACY_NAME, TRADE_NAME, DNO, REQUESTED_QUANTITY)
+            VALUES (:NEW.PHARMACY_ADDRESS, :NEW.PHARMACY_NAME, :NEW.TRADE_NAME, :NEW.DNO, v_req_qty);
+            INSERT INTO Audit_Log (TABLE_NAME, OPERATION_TYPE, RECORD_ID, NEW_VALUES_SUMMARY, CHANGED_BY, IP_ADDRESS)
+            VALUES ('REORDER_REQUESTS', 'INSERT', NULL, 'Auto-reorder for '||:NEW.TRADE_NAME||' at '||:NEW.PHARMACY_NAME||' qty:'||TO_CHAR(v_req_qty), v_user_id, v_ip);
+        END IF;
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        INSERT INTO Audit_Log (TABLE_NAME, OPERATION_TYPE, RECORD_ID, NEW_VALUES_SUMMARY, CHANGED_BY, IP_ADDRESS)
+        VALUES ('PHARMACY_STOCK', 'ERROR', NULL, 'Auto-reorder trigger error: ' || SQLERRM, v_user_id, v_ip);
+END;
+/
+CREATE OR REPLACE TRIGGER trg_drug_interactions_canonical
+BEFORE INSERT OR UPDATE ON Drug_Interactions
+FOR EACH ROW
+DECLARE
+    v_temp_name VARCHAR2(100);
+    v_temp_dno NUMBER;
+BEGIN
+    IF :NEW.DRUG1_NAME > :NEW.DRUG2_NAME OR (:NEW.DRUG1_NAME = :NEW.DRUG2_NAME AND :NEW.DRUG1_DNO > :NEW.DRUG2_DNO) THEN
+        v_temp_name := :NEW.DRUG1_NAME;
+        v_temp_dno  := :NEW.DRUG1_DNO;
+        :NEW.DRUG1_NAME := :NEW.DRUG2_NAME;
+        :NEW.DRUG1_DNO := :NEW.DRUG2_DNO;
+        :NEW.DRUG2_NAME := v_temp_name;
+        :NEW.DRUG2_DNO := v_temp_dno;
+    END IF;
+END;
+/
+CREATE OR REPLACE PROCEDURE create_user(
+    p_user_id IN VARCHAR2,
+    p_username IN VARCHAR2,
+    p_password IN VARCHAR2,
+    p_role IN VARCHAR2,
+    p_created_by IN VARCHAR2
+)
+IS
+    v_exists NUMBER;
+    v_hashed RAW(32);
+    v_salt RAW(16);
+BEGIN
+    IF NOT sec_pkg.validate_password_policy(p_password) THEN
+        RAISE_APPLICATION_ERROR(-20010, 'Password does not meet policy.');
+    END IF;
+    SELECT COUNT(*) INTO v_exists FROM System_Users WHERE USER_ID = p_user_id OR USERNAME = p_username;
+    IF v_exists > 0 THEN RAISE_APPLICATION_ERROR(-20011, 'Username or User ID already exists.'); END IF;
+    v_salt := sec_pkg.gen_salt();
+    v_hashed := sec_pkg.hash_with_salt(p_password, v_salt);
+    INSERT INTO System_Users (USER_ID, USERNAME, PASSWORD_HASH, SALT, USER_ROLE, CREATED_BY)
+    VALUES (p_user_id, p_username, v_hashed, v_salt, p_role, p_created_by);
+END;
+/
+CREATE OR REPLACE PROCEDURE authenticate_user(
+    p_username IN VARCHAR2,
+    p_password IN VARCHAR2,
+    p_result OUT NUMBER,
+    p_user_id OUT VARCHAR2,
+    p_role OUT VARCHAR2
+)
+IS
+    v_stored_hash RAW(32);
+    v_salt RAW(16);
+    v_is_active NUMBER;
+    v_hashed_password RAW(32);
+BEGIN
+    SELECT USER_ID, PASSWORD_HASH, SALT, USER_ROLE, IS_ACTIVE
+    INTO p_user_id, v_stored_hash, v_salt, p_role, v_is_active
+    FROM System_Users
+    WHERE USERNAME = p_username;
+    IF v_is_active = 0 THEN p_result := 0; RETURN; END IF;
+    v_hashed_password := sec_pkg.hash_with_salt(p_password, v_salt);
+    IF v_stored_hash = v_hashed_password THEN
+        p_result := 1;
+        UPDATE System_Users SET LAST_LOGIN = SYSDATE WHERE USER_ID = p_user_id;
+    ELSE
+        p_result := 0;
+    END IF;
+EXCEPTION WHEN NO_DATA_FOUND THEN p_result := 0; WHEN OTHERS THEN p_result := 0;
+END;
+/
+CREATE OR REPLACE PROCEDURE AddPatient (
+    p_AadharID IN VARCHAR2,
+    p_Name IN VARCHAR2,
+    p_Address IN VARCHAR2,
+    p_Age IN NUMBER,
+    p_primary_phy_id IN VARCHAR2,
+    p_email IN VARCHAR2 DEFAULT NULL,
+    p_phone IN VARCHAR2 DEFAULT NULL,
+    p_blood_group IN VARCHAR2 DEFAULT NULL,
+    p_insurance_id IN VARCHAR2 DEFAULT NULL
+) IS
+    v_exists NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_exists FROM Patient WHERE P_AADHAR_ID = p_AadharID AND IS_ACTIVE = 1;
+    IF v_exists = 0 THEN
+        INSERT INTO Patient (P_AADHAR_ID, NAME, PATIENT_ADDRESS, AGE, PRIMARY_PHY_ID, EMAIL, PHONE, BLOOD_GROUP, INSURANCE_ID)
+        VALUES (p_AadharID, p_Name, p_Address, p_Age, p_primary_phy_id, p_email, p_phone, p_blood_group, p_insurance_id);
+    ELSE
+        RAISE_APPLICATION_ERROR(-20012, 'Active patient with this Aadhar ID already exists.');
+    END IF;
+END;
+/
+CREATE OR REPLACE PROCEDURE add_doctor(
+    p_d_aadhar_id VARCHAR2,
+    p_name VARCHAR2,
+    p_speciality VARCHAR2,
+    p_yrs_of_exp NUMBER,
+    p_license VARCHAR2 DEFAULT NULL,
+    p_email VARCHAR2 DEFAULT NULL,
+    p_phone VARCHAR2 DEFAULT NULL,
+    p_fee NUMBER DEFAULT NULL
+)
+IS
+    v_exists NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_exists FROM Doctor WHERE D_AADHAR_ID = p_d_aadhar_id AND IS_ACTIVE = 1;
+    IF v_exists > 0 THEN RAISE_APPLICATION_ERROR(-20013, 'Active doctor with this Aadhar ID already exists.'); END IF;
+    INSERT INTO Doctor(D_AADHAR_ID, NAME, SPECIALITY, YRS_OF_EXP, LICENSE_NUMBER, EMAIL, PHONE, CONSULTATION_FEE)
+    VALUES (p_d_aadhar_id, p_name, p_speciality, p_yrs_of_exp, p_license, p_email, p_phone, p_fee);
+END;
+/
+CREATE OR REPLACE PROCEDURE add_drug(
+    p_trade_name IN VARCHAR2,
+    p_dno IN NUMBER,
+    p_formula IN VARCHAR2,
+    p_pname IN VARCHAR2,
+    p_drug_price IN NUMBER,
+    p_price IN NUMBER,
+    p_category IN VARCHAR2 DEFAULT NULL,
+    p_side_effects IN VARCHAR2 DEFAULT NULL
+)
+IS
+    v_duplicate NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_duplicate FROM drug WHERE trade_name = p_trade_name AND dno = p_dno AND IS_ACTIVE = 1;
+    IF v_duplicate > 0 THEN RAISE_APPLICATION_ERROR(-20014, 'Active drug already exists.'); END IF;
+    INSERT INTO drug (trade_name, dno, formula, pname, drug_price, price, category, side_effects)
+    VALUES (p_trade_name, p_dno, p_formula, p_pname, p_drug_price, p_price, p_category, p_side_effects);
+END;
+/
+CREATE OR REPLACE PROCEDURE add_drug_interaction(
+    p_drug1_name IN VARCHAR2,
+    p_drug1_dno IN NUMBER,
+    p_drug2_name IN VARCHAR2,
+    p_drug2_dno IN NUMBER,
+    p_severity IN VARCHAR2,
+    p_description IN VARCHAR2
+)
+IS
+BEGIN
+    INSERT INTO Drug_Interactions (DRUG1_NAME, DRUG1_DNO, DRUG2_NAME, DRUG2_DNO, SEVERITY, DESCRIPTION)
+    VALUES (p_drug1_name, p_drug1_dno, p_drug2_name, p_drug2_dno, p_severity, p_description);
+EXCEPTION WHEN DUP_VAL_ON_INDEX THEN RAISE_APPLICATION_ERROR(-20015, 'Drug interaction already exists.');
+END;
+/
+CREATE OR REPLACE PROCEDURE check_drug_interactions(
+    p_patient_id IN VARCHAR2,
+    p_new_drug_name IN VARCHAR2,
+    p_new_drug_dno IN NUMBER
+)
+IS
+    CURSOR c_interactions IS
+        SELECT di.DRUG2_NAME AS other_name, di.DRUG2_DNO AS other_dno, di.SEVERITY, di.DESCRIPTION
+        FROM Prescription pr
+        JOIN Drug_Interactions di ON (pr.TRADE_NAME = di.DRUG1_NAME AND pr.DNO = di.DRUG1_DNO)
+        WHERE pr.P_AADHAR_ID = p_patient_id AND pr.STATUS = 'ACTIVE' AND di.DRUG2_NAME = p_new_drug_name AND di.DRUG2_DNO = p_new_drug_dno
+        UNION
+        SELECT di.DRUG1_NAME AS other_name, di.DRUG1_DNO AS other_dno, di.SEVERITY, di.DESCRIPTION
+        FROM Prescription pr
+        JOIN Drug_Interactions di ON (pr.TRADE_NAME = di.DRUG2_NAME AND pr.DNO = di.DRUG2_DNO)
+        WHERE pr.P_AADHAR_ID = p_patient_id AND pr.STATUS = 'ACTIVE' AND di.DRUG1_NAME = p_new_drug_name AND di.DRUG1_DNO = p_new_drug_dno;
+    v_count NUMBER := 0;
+BEGIN
+    FOR rec IN c_interactions LOOP
+        v_count := v_count + 1;
+        IF rec.SEVERITY IN ('CRITICAL', 'SEVERE') THEN
+            RAISE_APPLICATION_ERROR(-20001, 'Severe/Critical drug interaction detected with ' || rec.other_name || '. Prescription cannot be issued without override.');
+        END IF;
+    END LOOP;
+END;
+/
+CREATE OR REPLACE PROCEDURE add_prescription(
+    p_pno OUT NUMBER,
+    p_p_date IN DATE,
+    p_quantity IN NUMBER,
+    p_d_aadhar_id IN VARCHAR2,
+    p_p_aadhar_id IN VARCHAR2,
+    p_trade_name IN VARCHAR2,
+    p_dno IN NUMBER,
+    p_dosage IN VARCHAR2 DEFAULT NULL,
+    p_duration IN NUMBER DEFAULT NULL,
+    p_refills IN NUMBER DEFAULT 0
+)
+IS
+    v_patient_exists NUMBER;
+    v_doctor_exists NUMBER;
+    v_drug_exists NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_patient_exists FROM Patient WHERE P_AADHAR_ID = p_p_aadhar_id AND IS_ACTIVE = 1;
+    IF v_patient_exists = 0 THEN RAISE_APPLICATION_ERROR(-20002, 'Patient not found or inactive.'); END IF;
+    SELECT COUNT(*) INTO v_doctor_exists FROM Doctor WHERE D_AADHAR_ID = p_d_aadhar_id AND IS_ACTIVE = 1;
+    IF v_doctor_exists = 0 THEN RAISE_APPLICATION_ERROR(-20003, 'Doctor not found or inactive.'); END IF;
+    SELECT COUNT(*) INTO v_drug_exists FROM Drug WHERE TRADE_NAME = p_trade_name AND DNO = p_dno AND IS_ACTIVE = 1;
+    IF v_drug_exists = 0 THEN RAISE_APPLICATION_ERROR(-20004, 'Drug not found or inactive.'); END IF;
+    check_drug_interactions(p_p_aadhar_id, p_trade_name, p_dno);
+    INSERT INTO prescription (P_DATE, QUANTITY, D_AADHAR_ID, P_AADHAR_ID, TRADE_NAME, DNO, DOSAGE_INSTRUCTIONS, DURATION_DAYS, REFILLS_ALLOWED, REFILLS_REMAINING)
+    VALUES (p_p_date, p_quantity, p_d_aadhar_id, p_p_aadhar_id, p_trade_name, p_dno, p_dosage, p_duration, p_refills, p_refills)
+    RETURNING PNO INTO p_pno;
+END;
+/
+CREATE OR REPLACE PROCEDURE process_refill(
+    p_pno IN NUMBER,
+    p_pharmacy_address IN VARCHAR2,
+    p_pharmacy_name IN VARCHAR2,
+    p_quantity IN NUMBER,
+    p_dispensed_by IN VARCHAR2
+)
+IS
+    v_refills_remaining NUMBER;
+    v_status VARCHAR2(20);
+    v_presc_quantity NUMBER;
+    v_refills_allowed NUMBER;
+    v_total_allowed NUMBER;
+    v_total_dispensed NUMBER;
+BEGIN
+    SELECT REFILLS_REMAINING, STATUS, QUANTITY, REFILLS_ALLOWED
+    INTO v_refills_remaining, v_status, v_presc_quantity, v_refills_allowed
+    FROM Prescription
+    WHERE PNO = p_pno
+    FOR UPDATE;
+    IF v_status != 'ACTIVE' THEN RAISE_APPLICATION_ERROR(-20020, 'Prescription not active.'); END IF;
+    IF v_refills_remaining <= 0 THEN RAISE_APPLICATION_ERROR(-20021, 'No refills remaining.'); END IF;
+    BEGIN
+        FOR r IN (SELECT REFILL_ID FROM Prescription_Refills WHERE PNO = p_pno FOR UPDATE) LOOP NULL; END LOOP;
+    EXCEPTION WHEN NO_DATA_FOUND THEN NULL;
+    END;
+    SELECT NVL(SUM(QUANTITY_DISPENSED), 0) INTO v_total_dispensed FROM Prescription_Refills WHERE PNO = p_pno FOR UPDATE;
+    v_total_allowed := NVL(v_presc_quantity,0) * (1 + NVL(v_refills_allowed,0));
+    IF (v_total_dispensed + p_quantity) > v_total_allowed THEN RAISE_APPLICATION_ERROR(-20005, 'Refill would exceed total authorized prescription quantity.'); END IF;
+    INSERT INTO Prescription_Refills (PNO, TRADE_NAME, DNO, PHARMACY_ADDRESS, PHARMACY_NAME, QUANTITY_DISPENSED, DISPENSED_BY)
+    SELECT PNO, TRADE_NAME, DNO, p_pharmacy_address, p_pharmacy_name, p_quantity, p_dispensed_by FROM Prescription WHERE PNO = p_pno;
+    UPDATE Prescription SET REFILLS_REMAINING = REFILLS_REMAINING - 1 WHERE PNO = p_pno;
+END;
+/
+CREATE OR REPLACE PROCEDURE submit_insurance_claim(
+    p_patient_id IN VARCHAR2,
+    p_pno IN NUMBER,
+    p_insurance_id IN VARCHAR2,
+    p_claim_amount IN NUMBER
+)
+IS
+    v_presc_exists NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO v_presc_exists FROM Prescription WHERE PNO = p_pno AND P_AADHAR_ID = p_patient_id;
+    IF v_presc_exists = 0 THEN RAISE_APPLICATION_ERROR(-20006, 'Prescription does not exist for this patient.'); END IF;
+    INSERT INTO Insurance_Claims (P_AADHAR_ID, PNO, INSURANCE_ID, CLAIM_AMOUNT)
+    VALUES (p_patient_id, p_pno, p_insurance_id, p_claim_amount);
+END;
+/
+CREATE OR REPLACE PROCEDURE process_insurance_claim(
+    p_claim_id IN NUMBER,
+    p_status IN VARCHAR2,
+    p_approved_amount IN NUMBER DEFAULT NULL,
+    p_rejection_reason IN VARCHAR2 DEFAULT NULL
+)
+IS
+    v_current_status VARCHAR2(20);
+    v_prescription_cost NUMBER;
+BEGIN
+    SELECT APPROVAL_STATUS INTO v_current_status FROM Insurance_Claims WHERE CLAIM_ID = p_claim_id FOR UPDATE;
+    IF p_status = 'APPROVED' AND p_approved_amount IS NULL THEN RAISE_APPLICATION_ERROR(-20002, 'Approved amount must be specified for approved claims.'); ELSIF p_status = 'REJECTED' AND p_rejection_reason IS NULL THEN RAISE_APPLICATION_ERROR(-20003, 'Rejection reason must be specified for rejected claims.'); END IF;
+    SELECT pr.QUANTITY * NVL(d.DRUG_PRICE,0) INTO v_prescription_cost FROM Insurance_Claims ic JOIN Prescription pr ON pr.PNO = ic.PNO JOIN Drug d ON d.TRADE_NAME = pr.TRADE_NAME AND d.DNO = pr.DNO WHERE ic.CLAIM_ID = p_claim_id;
+    IF p_status = 'APPROVED' AND p_approved_amount > NVL(v_prescription_cost,0) THEN RAISE_APPLICATION_ERROR(-20007, 'Approved amount exceeds prescription cost: ' || NVL(v_prescription_cost,0)); END IF;
+    UPDATE Insurance_Claims SET APPROVAL_STATUS = p_status, APPROVED_AMOUNT = CASE WHEN p_status = 'APPROVED' THEN p_approved_amount ELSE NULL END, PROCESSED_DATE = SYSDATE, REJECTION_REASON = CASE WHEN p_status = 'REJECTED' THEN p_rejection_reason ELSE NULL END WHERE CLAIM_ID = p_claim_id;
+END;
+/
+CREATE OR REPLACE PROCEDURE view_audit_trail(
+    p_table_name IN VARCHAR2 DEFAULT NULL,
+    p_start_date IN DATE DEFAULT SYSDATE - 30,
+    p_end_date IN DATE DEFAULT SYSDATE
+)
+IS
+    CURSOR c_audit IS
+        SELECT AUDIT_ID, TABLE_NAME, OPERATION_TYPE, RECORD_ID, CHANGED_BY, CHANGE_TIMESTAMP
+        FROM Audit_Log
+        WHERE (p_table_name IS NULL OR TABLE_NAME = p_table_name) AND CHANGE_TIMESTAMP BETWEEN p_start_date AND p_end_date
+        ORDER BY CHANGE_TIMESTAMP DESC;
+BEGIN
+    IF p_start_date IS NULL OR p_end_date IS NULL OR p_start_date > p_end_date THEN RAISE_APPLICATION_ERROR(-20030, 'Invalid date range.'); END IF;
+    FOR rec IN c_audit LOOP
+        DBMS_OUTPUT.PUT_LINE('ID:' || rec.AUDIT_ID || ' Table:' || rec.TABLE_NAME || ' Op:' || rec.OPERATION_TYPE || ' By:' || rec.CHANGED_BY || ' When:' || TO_CHAR(rec.CHANGE_TIMESTAMP,'DD-MON-YYYY HH24:MI'));
+    END LOOP;
+END;
+/
+
